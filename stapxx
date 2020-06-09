@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
+# author: damonchen
+# date: 2020-06-09
+# translate from perl implement to python implement
+
+import os
+import sys
+import glob
+import platform
+import subprocess
+import re
+import argparse
+import tempfile
+
+
+def cmd_run(cmd, stdin=None):
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate(stdin)
+    return stdout.decode('utf-8'), stderr.decode('utf-8')
+
+
+def die(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.exit(1)
+
+
+def warn(*args, **kwargs):
+    print(*args, **kwargs)
+
+
+def get_child_processes(pid):
+    children = []
+    files = glob.glob("proc/*/stat")
+    files = [file for file in files if file.startswith('/proc/{}'.format(pid))]
+    for file in files:
+        with open(file, 'r') as fp:
+            for line in fp:
+                data = line.split(' ')
+                child, parent = data[0], data[3]
+                if parent == pid:
+                    children.append(child)
+    children = sorted(children)
+    return children
+
+
+def read_src_file(file):
+    with open(file, "r") as fp:
+        return fp.read()
+
+
+def gen_pid_test_condition(pids):
+    if not pids:
+        return "pid() == target()"
+
+    c = []
+    for pid in pids:
+        c.append(f"pid() == {pid}")
+    return "(" + " || ".join(c) + ")"
+
+
+def process_dso(pid):
+    maps_file = f"/proc/{pid}/maps"
+    pattern = re.compile(r'\S+\.so(?:\.\d+)*$')
+    with open(maps_file, "r") as fp:
+        for line in fp:
+            match = pattern.match(line)
+            if match:
+                path = match.groups()[0]
+                dsos[path] = True
+
+    for path in sorted(dsos.keys()):
+        stap_opts.append("-d")
+        stap_opts.append(path)
+
+
+def quote_sh_args(args):
+    pattern = re.compile(r'^[- "&%;,|?*.+=\w:/()]*$')
+    arg_pattern = re.compile(r'[ "&%;,|?*()]')
+
+    args_ret = []
+    for arg in args:
+        match = pattern.match(arg)
+        if match:
+            if arg_pattern.match(arg):
+                arg = f"'{arg}'"
+                args_ret.append(arg)
+                continue
+
+        arg = arg.replace('\\', '\\\\')
+        arg = re.sub("'", "\\'", arg)
+        arg = re.sub("\n", "\\n", arg)
+        arg = re.sub("\r", "\\r", arg)
+        arg = re.sub("\t", "\\t", arg)
+
+        args_ret.append(arg)
+
+    return args_ret
+
+
+def eval_usr_var(file, user_vars, var):
+    if user_vars[var]:
+        return user_vars[var]
+
+    # todo fix: line
+    line = 0
+    die(f'{file}: line {line}: Undefined user variable \$*{var}.\n')
+    sys.exit(1)
+
+
+def eval_std_var_line(line_no):
+    def eval_std_var(file, variable, trait_name, trait_val):
+        used_std_vars[variable] = True
+
+        if std_vars[variable]:
+            return std_vars[variable]
+
+        pattern = re.compile(r'^arg_(\w+)$')
+        match = pattern.match(variable)
+
+        if trait_name:
+            if trait_name == 'default':
+                if print_args and match:
+                    used_args[match.groups()[0]] = trait_val
+
+                std_vars[variable] = trait_val
+                return trait_val
+        else:
+            die(f'{file}: line: {line_no}: unknown trait name: {trait_name}\n')
+
+        if print_args:
+            if match:
+                used_args[match.groups()[0]] = None
+            return ''
+
+        path_pattern = re.compile(r'^(lib\w+)_path$')
+        path_match = path_pattern.match(variable)
+
+        if variable == 'exec_path':
+            die(f'{file}: line: {line_no}: $^exec_path is used but neither -x <pid> '
+                'nor --exec <path> is specified.\n')
+            sys.exit(1)
+        elif matched:
+            v = matched.groups()[0]
+            die(f'{file}: line:{line_no} $^{variable} is used but no --arg {v}=VAL option is specified.\n')
+        elif path_match:
+            prefix = path_match.groups()[0]
+            lib_path = find_dso_path(prefix)
+            if not lib_path:
+                pass
+            return lib_path
+        else:
+            die(f'{file}: line: {line}: Undefined built-in variable \$^$var.\n')
+
+    return eval_std_var
+
+
+def find_dso_path(prefix):
+    path = lib_paths[prefix]
+    if path:
+        return path
+
+    pattern = re.compile(r'^lib(\S+)')
+    match = pattern.match(prefix)
+    if not match:
+        die(f"bad pattern: {prefix}")
+
+    name = match.groups()[0]
+
+    found_path = ''
+    lib_pattern = re.compile(rf'\blib\Q{name}\E[-.\d]*\.so(?:\.\d+)*$')
+    lib_pattern2 = re.compile(rf'\b(?:lib)?\Q{name}\E[-.\d]*\.so(?:\.\d+)*$')
+
+    for path in sorted(dsos.keys()):
+        match = lib_pattern.match(path)
+        if match:
+            lib_paths[prefix] = path
+            found_path = path
+            warn(f"found exact match for {prefix}: {path}\n")
+            break
+
+        match = lib_pattern2.match(path)
+        if match:
+            if found_path:
+                warn(f"Ignored ambiguous libarary {path} for \"{prefix}\"")
+                continue
+
+            lib_paths[prefix] = path
+            found_path = path
+
+    return found_path
+
+
+def use_libs_line(line_no):
+    def use_libs(file, libs):
+        pattern = re.compile(r'\s*,\s*')
+        libs = pattern.split(libs)
+
+        for lib in libs:
+            path = "/".join(lib.split('.')) + ".sxx"
+
+            found = False
+            for dir in inc:
+                abspath = os.path.join(dir, path)
+                if os.path.exists(abspath):
+                    src = read_src_file(abspath)
+                    used_libs[lib] = process_src(abspath, src)
+                    found = True
+                    break
+            if not found:
+                die(f'{file}: line: {line_no}: cannot find use library {lib}')
+        return ""
+
+    return use_libs
+
+
+def process_src(file, src):
+    usr_vars = {}
+    bits = []
+
+    libname_pat = r'(?:\w+(?:\.\w+)*)'
+
+    lines = src.split('\n')
+    sebang_pattern = re.compile(r'^\#!')
+
+    for line_no, line in enumerate(lines):
+        if line_no == 0 and sebang_pattern.match(line):
+            bits.append('#!/usr/bin/env stap')
+            continue
+
+        eval_std_var = eval_std_var_line(line_no)
+
+        matched = re.match(r'\$\^(arg_\w+)(?:\s*:(\w+)\s*\((.*?)\))?', line)
+        if matched:
+            variable, trait_name, trait_val = matched.groups()
+            line = eval_std_var(file, variable, trait_name, trait_val)
+
+        matched = re.match(r'\@pfunc\s*\(\s*(\w+)\s*\)', line)
+        if matched:
+            function = matched.groups()[0]
+            line = f'process("{exec_path}").function("{function}")'
+
+        matched = re.match(r'\$\^(\w+|lib[-.\w]+_path)(?:\s*:(\w+)\s*\((.*?)\))?', line)
+        if matched:
+            variable, trait_name, trait_val = matched.groups()
+            line = eval_std_var(file, variable, trait_name, trait_val)
+
+        matched = re.match(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', line)
+        if matched:
+            groups = matched.groups()
+            key, value = groups[1], groups[2]
+            usr_vars[key] = value
+            line = ""
+
+        matched = re.match(r'\$\*(\w+)', line)
+        if matched:
+            variable = matched.groups()[0]
+            line = eval_usr_var(file, usr_vars, variable)
+
+        p = rf'\@use\s+({libname_pat}(?:\s*,\s*{libname_pat})*)'
+        matched = re.match(p, line)
+        if matched:
+            libs = matched.groups()[0]
+            use_libs = use_libs_line(line_no)
+            line = use_libs(file, libs)
+
+        bits.append(line)
+
+    return '\n'.join(bits)
+
+
+def find_bin():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+parser = argparse.ArgumentParser(epilog='''Examples:
+stap++ -x 12345 -e 'probe begin { println("hello") exit() }'
+stap++ -x 12345 infile.ss
+''', formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument('-D', help='Emit macro definition into generated C code.', dest='D_opts', action='append')
+parser.add_argument('-c', help='start the probes, run CMD, and exit when it finishes.', dest='shcmd')
+parser.add_argument('-d', help='Load debug info for the specified objects.', dest='d_opts', action='append')
+parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args')
+parser.add_argument('--args', help='Print all available arguments for --arg.', dest='print_args')
+parser.add_argument('--dump-src', help='dump source', dest='dump_src')
+parser.add_argument('--sample-pid', help='Sample process to inspect DSO objects to load via -d.', dest='sample_pid',
+                    type=int)
+parser.add_argument('--exec', help='Specify the executable file path to be traced.', dest='exec_path', type=str)
+parser.add_argument('--master', help='Specify the master pid whose child processes are traced.', dest='master_pid',
+                    type=int)
+parser.add_argument('-x', help='Sets target() to PID (also for $^exec_path and $^libxxx_path).', dest='pid')
+parser.add_argument('-e', help='Run given script.', dest='src', type=str)
+# parser.add_argument('--help', help='Print this help.')
+parser.add_argument('-v', help='Be verbose.', default=False, dest='verbose')
+parser.add_argument('-skip-badvars', help='Be verbose.', default=False, dest='skip_badvars')
+parser.add_argument('-I', help='Specify the stap++ tapset library search directory.', dest='inc', action='append')
+parser.add_argument('filename', nargs='?')
+
+args = parser.parse_args()
+
+shcmd = args.shcmd
+D_opts = args.D_opts if args.D_opts else []
+d_opts = args.d_opts if args.d_opts else []
+_args = args.args if args.args else {}
+print_args = args.print_args
+dump_src = args.dump_src
+sample_pid = args.sample_pid
+exec_path = args.exec_path
+master_pid = args.master_pid
+pid = args.pid
+src = args.src
+verbose = args.verbose
+skip_badvars = args.skip_badvars
+inc = args.inc if args.inc else []
+infile = args.filename
+args = _args
+
+inc.append('.')
+bin_path = find_bin()
+inc.append(f'{bin_path}/tapset')
+
+set_D_opts = {}
+
+std_vars = {}
+used_libs = {}
+dsos = {}
+lib_paths = {}
+used_std_vars = {}
+stap_opts = []
+used_args = {}
+
+system = platform.system().lower()
+if system != 'linux':
+    die(f'Only linux is supported but I am on {system}')
+
+if print_args and args:
+    die('No --arg is allowed when --args is specified.\n')
+
+ver = ''
+try:
+    ver, _ = cmd_run(['stap', '-V', '2>&1'])
+except OSError as e:
+    die(f'Systemtap not installed or its "stap" utility is not visible to the PATH environment: {e}\n')
+
+version = re.compile(r'version\s+(\d+\.\d+)', re.I)
+matched = version.search(ver)
+if matched:
+    v = matched.groups()[0]
+    min_ver = '2.3'
+    if v < min_ver:
+        die(f'ERROR: at least systemtap {min_ver} is required but found {v}\n')
+else:
+    die(f"ERROR: unknown version of systemtap:\n{ver}\n")
+
+if d_opts:
+    opt_pattern = re.compile('^([_A-Z]+)=')
+    for opt in D_opts:
+        match = opt_pattern.match(opt)
+        if match:
+            set_D_opts[match.groups()[0]] = True
+
+if 'MAXACTION' not in set_D_opts:
+    d_opts.append('MAXACTION=100000')
+if 'MAXMAPENTRIES' not in set_D_opts:
+    d_opts.append('MAXMAPENTRIES=5000')
+if 'MAXBACKTRACE' not in set_D_opts:
+    d_opts.append('MAXBACKTRACE=200')
+
+if not src:
+    if not infile:
+        die("No input file specified.\n")
+    src = read_src_file(infile)
+else:
+    infile = '-e'
+
+if verbose:
+    stap_opts.append("-v")
+
+if d_opts:
+    for opt in d_opts:
+        stap_opts.append('-d')
+        stap_opts.append(opt)
+
+if skip_badvars:
+    stap_opts.append('--skip-badvars')
+
+for opt in D_opts:
+    stap_opts.append(f'-D{opt}')
+
+if exec_path:
+    if not os.path.exists(exec_path):
+        die(f"{exec_path} not found \n")
+
+    std_vars['exec_path'] = exec_path
+    stap_opts.append("-d")
+    stap_opts.append(exec_path)
+
+    try:
+        pattern = re.compile(r'\s+(/\S+\.so(?:\.\d+)*)')
+
+        stdout, _ = cmd_run(['ldd', exec_path])
+        lines = stdout.split('\n')
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                path = match.groups()[0]
+                dsos[path] = True
+
+        for path in sorted(dsos.keys()):
+            stap_opts.append("-d")
+            stap_opts.append(path)
+
+    except OSError as e:
+        die(f"cannot run the command \"ldd {exec_path}\": {e}\n")
+
+if pid:
+    if master_pid:
+        die("-x <pid> and --master <pid> are exclusive.\n")
+
+    stap_opts.append("-x")
+    stap_opts.append(pid)
+
+    exec_file = f"/proc/{pid}/exe"
+    if not os.path.exists(exec_file):
+        die(f"Nginx process {pid} is not running or you do not have enough permissions\n")
+
+    std_vars['pid_ok'] = gen_pid_test_condition()
+    std_vars['target'] = pid
+
+    if not exec_path:
+        exec_path = os.readlink(exec_file)
+        std_vars['exec_path'] = exec_path
+        stap_opts.append("-d")
+        stap_opts.append(exec_path)
+
+    process_dso(pid)
+
+if master_pid:
+    exec_file = "/proc/{}/exe".format(master_pid)
+    if not os.path.exists(exec_file):
+        die("nginx process {} is not running or" \
+            "you do not have enought permissions.\n".format(master_pid))
+
+    if not os.path.exists(exec_path):
+        exec_path = os.readlink(exec_file)
+        std_vars['exec_path'] = exec_path
+        stap_opts.append("-d")
+        stap_opts.append(exec_path)
+
+    pids = get_child_processes(master_pid)
+    if not pids:
+        die("No child processes found for {}".format(master_pid))
+
+    std_vars['pid_ok'] = gen_pid_test_condition(pids)
+    std_vars['target'] = "".join(pids)
+
+    pid = pids[0]
+    process_dso(pid)
+
+if sample_pid:
+    process_dso(sample_pid)
+
+if not std_vars.get("pid_ok") and exec_path:
+    std_vars["pid_ok"] = "1"
+
+if not std_vars.get("target") and exec_path:
+    std_vars["target"] = "ANY"
+
+if not print_args:
+    for key, value in args.items():
+        std_vars[f"arg_{key}"] = value
+
+stap_src = process_src(infile, src)
+if dump_src:
+    print(stap_src)
+    sys.exit(0)
+
+if print_args:
+    for name in sorted(used_args.keys()):
+        default = used_args[name]
+        print(f"\t--arg {default}=VALUE")
+
+        if default:
+            print(f" (default: {default})\n")
+        else:
+            print("\n")
+    sys.exit(0)
+
+for key in args.keys():
+    if not used_std_vars[f"arg_{key}"]:
+        val = args[key]
+        if not val:
+            val = ''
+
+        warn(f"WARNING: arg_{key} is defined by \" --arg {key}={val}\, "
+             "but never used.\n")
+
+tmpdir = tempfile.mkdtemp(prefix='stapxx')
+for lib, src in used_libs.items():
+    outfile = f"{tmpdir}/{lib}.stp"
+    with open(outfile, 'w') as fp:
+        fp.write(src)
+
+stap_opts.append("-I")
+stap_opts.append(tmpdir)
+
+if shcmd:
+    stap_opts.append("-c")
+    stap_opts.append(shcmd)
+
+cmd = ["stap"]
+cmd.extend(quote_sh_args(stap_opts))
+cmd.append('-')
+try:
+    stap_src = stap_src.encode('utf-8')
+    stdout, _ = cmd_run(cmd, stap_src)
+except OSError as e:
+    die(f"Cannot run stap: {e}\n")
