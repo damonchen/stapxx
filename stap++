@@ -36,7 +36,6 @@ def kill_stap(sig, frame):
     global stap_proc
     if stap_proc is not None:
         stap_proc.kill()
-    remove_tempdir()
     sys.exit(stap_proc.returncode)
 
 
@@ -227,7 +226,7 @@ def find_dso_path(prefix):
         match = lib_pattern2.match(path)
         if match:
             if found_path:
-                warn(f"Ignored ambiguous libarary {path} for \"{prefix}\"")
+                warn(f"Ignored ambiguous library {path} for \"{prefix}\"")
                 continue
 
             lib_paths[prefix] = path
@@ -600,7 +599,9 @@ try:
         output = p.stdout.readline()
         if output == '' and p.poll() is not None:
             break
-        print(output.rstrip().decode('utf-8'))
+        output = output.rstrip().decode('utf-8')
+        if output != '':
+            print(output)
 
     rc = p.poll()
     sys.exit(rc)
