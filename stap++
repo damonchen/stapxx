@@ -298,6 +298,16 @@ def find_bin():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def str2bool(val):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 parser = argparse.ArgumentParser(prog='stap++', epilog='''Examples:
 stap++ -x 12345 -e 'probe begin { println("hello") exit() }'
 stap++ -x 12345 infile.ss
@@ -307,7 +317,7 @@ parser.add_argument('-c', help='start the probes, run CMD, and exit when it fini
 parser.add_argument('-d', help='Load debug info for the specified objects.', dest='d_opts', action='append')
 parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args', action='append')
 parser.add_argument('--args', help='Print all available arguments for --arg.', dest='print_args')
-parser.add_argument('--dump-src', help='dump source', dest='dump_src', action='store_false', default=False)
+parser.add_argument('--dump-src', help='dump source', dest='dump_src', type=str2bool, nargs='?', const=True, default=False)
 parser.add_argument('--sample-pid', help='Sample process to inspect DSO objects to load via -d.', dest='sample_pid',
                     type=int)
 parser.add_argument('--exec', help='Specify the executable file path to be traced.', dest='exec_path', type=str)
