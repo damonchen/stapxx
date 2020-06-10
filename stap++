@@ -13,15 +13,30 @@ import re
 import argparse
 import tempfile
 import signal
+import shutil
+import atexit
 from pathlib import Path
 
 stap_proc = None
+
+
+def remove_tempdir():
+    global tmpdir
+    if tmpdir:
+        dir = tempfile.gettempdir()
+        if tmpdir.startswith(dir):
+            # this is a danger operator, so must check the tmpdir is in /tmp
+            shutil.rmtree(tmpdir)
+
+
+atexit.register(remove_tempdir)
 
 
 def kill_stap(sig, frame):
     global stap_proc
     if stap_proc is not None:
         stap_proc.kill()
+    remove_tempdir()
     sys.exit(stap_proc.returncode)
 
 
@@ -41,6 +56,12 @@ def die(*args, **kwargs):
 
 def warn(*args, **kwargs):
     print(*args, **kwargs)
+
+
+def verbose_out(*args, **kwargs):
+    if verbose:
+        print('verbose:', end='')
+        print(*args, **kwargs)
 
 
 def get_stat_files():
@@ -217,15 +238,18 @@ def find_dso_path(prefix):
 
 def use_libs_line(line_no):
     def use_libs(file, libs):
+        verbose_out(f"libs {libs}")
         pattern = re.compile(r'\s*,\s*')
         libs = pattern.split(libs)
 
         for lib in libs:
+            verbose_out(f"processing {lib}")
             path = "/".join(lib.split('.')) + ".sxx"
 
             found = False
             for dir in inc:
                 abspath = os.path.join(dir, path)
+                verbose_out(f"testing {abspath}")
                 if os.path.exists(abspath):
                     src = read_src_file(abspath)
                     used_libs[lib] = process_src(abspath, src)
@@ -242,8 +266,6 @@ def process_src(file, src):
     usr_vars = {}
     bits = []
 
-    libname_pat = r'(?:\w+(?:\.\w+)*)'
-
     lines = src.split('\n')
     sebang_pattern = re.compile(r'^\#!')
 
@@ -253,6 +275,7 @@ def process_src(file, src):
             continue
 
         eval_std_var = eval_std_var_line(file, line_no)
+
         def eval_std_var_match(matchobj):
             variable, trait_name, trait_val = matchobj.groups()
             return eval_std_var(variable, trait_name, trait_val)
@@ -272,9 +295,10 @@ def process_src(file, src):
             usr_vars[key] = value
             return ""
 
-        line  = re.sub(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', cast_var, line)
+        line = re.sub(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', cast_var, line)
 
         eval_usr_var = eval_usr_var_line(line_no)
+
         def eval_user_var_match(matchobj):
             variable = matchobj.groups()[0]
             return eval_usr_var(file, usr_vars, variable)
@@ -282,12 +306,12 @@ def process_src(file, src):
         line = re.sub(r'\$\*(\w+)', eval_user_var_match, line)
 
         use_libs = use_libs_line(line_no)
-        def libname_match(matchobj):
-            libs = matched.groups()[0]
-            return use_libs(file, libs)
 
-        p = rf'\@use\s+({libname_pat}(?:\s*,\s*{libname_pat})*)'
-        line = re.sub(p, libname_match, line)
+        p = r'@use\s+((?:\w+(?:\.\w+)*)(?:\s*,\s*(?:\w+(?:\.\w+)*))*)'
+        matched = re.search(p, line)
+        if matched:
+            libs = matched.groups()[0]
+            line = use_libs(file, libs)
 
         bits.append(line)
 
@@ -308,6 +332,7 @@ def str2bool(val):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
 parser = argparse.ArgumentParser(prog='stap++', epilog='''Examples:
 stap++ -x 12345 -e 'probe begin { println("hello") exit() }'
 stap++ -x 12345 infile.ss
@@ -317,7 +342,8 @@ parser.add_argument('-c', help='start the probes, run CMD, and exit when it fini
 parser.add_argument('-d', help='Load debug info for the specified objects.', dest='d_opts', action='append')
 parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args', action='append')
 parser.add_argument('--args', help='Print all available arguments for --arg.', dest='print_args')
-parser.add_argument('--dump-src', help='dump source', dest='dump_src', type=str2bool, nargs='?', const=True, default=False)
+parser.add_argument('--dump-src', help='dump source', dest='dump_src', type=str2bool, nargs='?', const=True,
+                    default=False)
 parser.add_argument('--sample-pid', help='Sample process to inspect DSO objects to load via -d.', dest='sample_pid',
                     type=int)
 parser.add_argument('--exec', help='Specify the executable file path to be traced.', dest='exec_path', type=str)
@@ -326,7 +352,8 @@ parser.add_argument('--master', help='Specify the master pid whose child process
 parser.add_argument('-x', help='Sets target() to PID (also for $^exec_path and $^libxxx_path).', dest='pid')
 parser.add_argument('-e', help='Run given script.', dest='src', type=str)
 # parser.add_argument('--help', help='Print this help.')
-parser.add_argument('-v', help='Be verbose.', default=False, dest='verbose', action='count')
+parser.add_argument('-v', help='Be verbose.', dest='verbose', type=str2bool, nargs='?', const=True,
+                    default=False)
 parser.add_argument('-skip-badvars', help='Be verbose.', default=False, dest='skip_badvars')
 parser.add_argument('-I', help='Specify the stap++ tapset library search directory.', dest='inc', action='append')
 parser.add_argument('--version', help='version', action='version', version='%(prog)s 0.0.1')
@@ -515,9 +542,6 @@ if not print_args:
         std_vars[f"arg_{key}"] = value
 
 stap_src = process_src(infile, src)
-if dump_src:
-    print(stap_src)
-    sys.exit(0)
 
 if print_args:
     for name in sorted(used_args.keys()):
@@ -539,7 +563,9 @@ for key in args.keys():
         warn(f"WARNING: arg_{key} is defined by \" --arg {key}={val} \", "
              "but never used.\n")
 
+verbose_out(f'used libs {used_libs}')
 tmpdir = tempfile.mkdtemp(prefix='stapxx')
+verbose_out(f'tmep dir {tmpdir}')
 for lib, src in used_libs.items():
     outfile = f"{tmpdir}/{lib}.stp"
     with open(outfile, 'w') as fp:
@@ -555,6 +581,13 @@ if shcmd:
 cmd = ["stap"]
 cmd.extend(quote_sh_args(stap_opts))
 cmd.append('-')
+
+if dump_src:
+    print(stap_src)
+    sys.exit(0)
+
+verbose_out(cmd)
+
 try:
     stap_src = stap_src.encode('utf-8')
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
