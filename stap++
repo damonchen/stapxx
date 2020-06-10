@@ -7,12 +7,26 @@
 
 import os
 import sys
-import glob
 import platform
 import subprocess
 import re
 import argparse
 import tempfile
+import signal
+from pathlib import Path
+
+
+
+stap_proc = None
+
+
+def kill_stap(sig, frame):
+    global stap_pid
+    if stap_proc is not None:
+        stap_proc.kill()
+    sys.exit(stap_proc.returncode)
+
+signal.signal(signal.SIGINT, kill_stap)
 
 
 def cmd_run(cmd, stdin=None):
@@ -30,17 +44,26 @@ def warn(*args, **kwargs):
     print(*args, **kwargs)
 
 
+def get_stat_files():
+    return [str(p) for p in Path("/proc").glob("[0-9]*/stat")]
+
+
 def get_child_processes(pid):
+    pattern = re.compile(r'^(\d+) \S+ \S+ (\d+)')
     children = []
-    files = glob.glob("proc/*/stat")
-    files = [file for file in files if file.startswith('/proc/{}'.format(pid))]
+    files = get_stat_files()
+
     for file in files:
+        if file.startswith(f'/proc/{pid}'):
+            continue
+
         with open(file, 'r') as fp:
             for line in fp:
-                data = line.split(' ')
-                child, parent = data[0], data[3]
-                if parent == pid:
-                    children.append(child)
+                match = pattern.match(line)
+                if match:
+                    child, parent = match.groups()
+                    if int(parent) == pid:
+                        children.append(child)
     children = sorted(children)
     return children
 
@@ -292,7 +315,7 @@ parser.add_argument('--master', help='Specify the master pid whose child process
 parser.add_argument('-x', help='Sets target() to PID (also for $^exec_path and $^libxxx_path).', dest='pid')
 parser.add_argument('-e', help='Run given script.', dest='src', type=str)
 # parser.add_argument('--help', help='Print this help.')
-parser.add_argument('-v', help='Be verbose.', default=False, dest='verbose')
+parser.add_argument('-v', help='Be verbose.', default=False, dest='verbose', action='count')
 parser.add_argument('-skip-badvars', help='Be verbose.', default=False, dest='skip_badvars')
 parser.add_argument('-I', help='Specify the stap++ tapset library search directory.', dest='inc', action='append')
 parser.add_argument('filename', nargs='?')
@@ -442,7 +465,7 @@ if master_pid:
         die("nginx process {} is not running or" \
             "you do not have enought permissions.\n".format(master_pid))
 
-    if not os.path.exists(exec_path):
+    if not exec_path:
         exec_path = os.readlink(exec_file)
         std_vars['exec_path'] = exec_path
         stap_opts.append("-d")
@@ -514,6 +537,19 @@ cmd.extend(quote_sh_args(stap_opts))
 cmd.append('-')
 try:
     stap_src = stap_src.encode('utf-8')
-    stdout, _ = cmd_run(cmd, stap_src)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    stap_proc = p
+
+    p.stdin.write(stap_src)
+    p.stdin.close()
+
+    while True:
+        output = p.stdout.readline()
+        if output == '' and p.poll() is not None:
+            break
+        print(output.rstrip().decode('utf-8'))
+
+    rc = p.poll()
+    sys.exit(rc)
 except OSError as e:
     die(f"Cannot run stap: {e}\n")
