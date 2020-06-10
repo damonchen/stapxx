@@ -15,16 +15,15 @@ import tempfile
 import signal
 from pathlib import Path
 
-
-
 stap_proc = None
 
 
 def kill_stap(sig, frame):
-    global stap_pid
+    global stap_proc
     if stap_proc is not None:
         stap_proc.kill()
     sys.exit(stap_proc.returncode)
+
 
 signal.signal(signal.SIGINT, kill_stap)
 
@@ -73,7 +72,7 @@ def read_src_file(file):
         return fp.read()
 
 
-def gen_pid_test_condition(pids):
+def gen_pid_test_condition(pids=None):
     if not pids:
         return "pid() == target()"
 
@@ -122,21 +121,22 @@ def quote_sh_args(args):
     return args_ret
 
 
-def eval_usr_var(file, user_vars, var):
-    if user_vars[var]:
-        return user_vars[var]
+def eval_usr_var_line(line_no):
+    def eval_usr_var(file, user_vars, var):
+        if user_vars[var]:
+            return user_vars[var]
 
-    # todo fix: line
-    line = 0
-    die(f'{file}: line {line}: Undefined user variable \$*{var}.\n')
-    sys.exit(1)
+        die(f'{file}: line {line_no}: Undefined user variable \$*{var}.\n')
+        sys.exit(1)
+
+    return eval_usr_var
 
 
-def eval_std_var_line(line_no):
-    def eval_std_var(file, variable, trait_name, trait_val):
+def eval_std_var_line(file, line_no):
+    def eval_std_var(variable, trait_name, trait_val):
         used_std_vars[variable] = True
 
-        if std_vars[variable]:
+        if std_vars.get(variable):
             return std_vars[variable]
 
         pattern = re.compile(r'^arg_(\w+)$')
@@ -149,8 +149,8 @@ def eval_std_var_line(line_no):
 
                 std_vars[variable] = trait_val
                 return trait_val
-        else:
-            die(f'{file}: line: {line_no}: unknown trait name: {trait_name}\n')
+            else:
+                die(f'{file}: line: {line_no}: unknown trait name: {trait_name}\n')
 
         if print_args:
             if match:
@@ -187,7 +187,7 @@ def find_dso_path(prefix):
     pattern = re.compile(r'^lib(\S+)')
     match = pattern.match(prefix)
     if not match:
-        die(f"bad pattern: {prefix}")
+        die(f"Bad pattern: {prefix}")
 
     name = match.groups()[0]
 
@@ -247,46 +247,47 @@ def process_src(file, src):
     lines = src.split('\n')
     sebang_pattern = re.compile(r'^\#!')
 
-    for line_no, line in enumerate(lines):
-        if line_no == 0 and sebang_pattern.match(line):
+    for line_no, line in enumerate(lines, start=1):
+        if line_no == 1 and sebang_pattern.match(line):
             bits.append('#!/usr/bin/env stap')
             continue
 
-        eval_std_var = eval_std_var_line(line_no)
+        eval_std_var = eval_std_var_line(file, line_no)
+        def eval_std_var_match(matchobj):
+            variable, trait_name, trait_val = matchobj.groups()
+            return eval_std_var(variable, trait_name, trait_val)
 
-        matched = re.match(r'\$\^(arg_\w+)(?:\s*:(\w+)\s*\((.*?)\))?', line)
-        if matched:
-            variable, trait_name, trait_val = matched.groups()
-            line = eval_std_var(file, variable, trait_name, trait_val)
+        line = re.sub(r'\$\^(arg_\w+)(?:\s*:(\w+)\s*\((.*?)\))?', eval_std_var_match, line)
 
-        matched = re.match(r'\@pfunc\s*\(\s*(\w+)\s*\)', line)
-        if matched:
-            function = matched.groups()[0]
-            line = f'process("{exec_path}").function("{function}")'
+        def process_function_match(matchobj):
+            function = matchobj.groups()[0]
+            return f'process("$^exec_path").function("{function}")'
 
-        matched = re.match(r'\$\^(\w+|lib[-.\w]+_path)(?:\s*:(\w+)\s*\((.*?)\))?', line)
-        if matched:
-            variable, trait_name, trait_val = matched.groups()
-            line = eval_std_var(file, variable, trait_name, trait_val)
+        line = re.sub(r'\@pfunc\s*\(\s*(\w+)\s*\)', process_function_match, line)
 
-        matched = re.match(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', line)
-        if matched:
-            groups = matched.groups()
-            key, value = groups[1], groups[2]
+        line = re.sub(r'\$\^(\w+|lib[-.\w]+_path)(?:\s*:(\w+)\s*\((.*?)\))?', eval_std_var_match, line)
+
+        def cast_var(matchobj):
+            key, value = matchobj.groups()
             usr_vars[key] = value
-            line = ""
+            return ""
 
-        matched = re.match(r'\$\*(\w+)', line)
-        if matched:
-            variable = matched.groups()[0]
-            line = eval_usr_var(file, usr_vars, variable)
+        line  = re.sub(r'\$\*(\w+)\s*:=\s*(\&?\@(?:cast|var)\(.*?\)(?:\[\d+\])?)', cast_var, line)
+
+        eval_usr_var = eval_usr_var_line(line_no)
+        def eval_user_var_match(matchobj):
+            variable = matchobj.groups()[0]
+            return eval_usr_var(file, usr_vars, variable)
+
+        line = re.sub(r'\$\*(\w+)', eval_user_var_match, line)
+
+        use_libs = use_libs_line(line_no)
+        def libname_match(matchobj):
+            libs = matched.groups()[0]
+            return use_libs(file, libs)
 
         p = rf'\@use\s+({libname_pat}(?:\s*,\s*{libname_pat})*)'
-        matched = re.match(p, line)
-        if matched:
-            libs = matched.groups()[0]
-            use_libs = use_libs_line(line_no)
-            line = use_libs(file, libs)
+        line = re.sub(p, libname_match, line)
 
         bits.append(line)
 
@@ -297,16 +298,16 @@ def find_bin():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-parser = argparse.ArgumentParser(epilog='''Examples:
+parser = argparse.ArgumentParser(prog='stap++', epilog='''Examples:
 stap++ -x 12345 -e 'probe begin { println("hello") exit() }'
 stap++ -x 12345 infile.ss
 ''', formatter_class=argparse.RawTextHelpFormatter)
 parser.add_argument('-D', help='Emit macro definition into generated C code.', dest='D_opts', action='append')
 parser.add_argument('-c', help='start the probes, run CMD, and exit when it finishes.', dest='shcmd')
 parser.add_argument('-d', help='Load debug info for the specified objects.', dest='d_opts', action='append')
-parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args')
+parser.add_argument('--arg', help='Specify extra user arguments (for $^arg_NM).', dest='args', action='append')
 parser.add_argument('--args', help='Print all available arguments for --arg.', dest='print_args')
-parser.add_argument('--dump-src', help='dump source', dest='dump_src')
+parser.add_argument('--dump-src', help='dump source', dest='dump_src', action='store_false', default=False)
 parser.add_argument('--sample-pid', help='Sample process to inspect DSO objects to load via -d.', dest='sample_pid',
                     type=int)
 parser.add_argument('--exec', help='Specify the executable file path to be traced.', dest='exec_path', type=str)
@@ -318,6 +319,7 @@ parser.add_argument('-e', help='Run given script.', dest='src', type=str)
 parser.add_argument('-v', help='Be verbose.', default=False, dest='verbose', action='count')
 parser.add_argument('-skip-badvars', help='Be verbose.', default=False, dest='skip_badvars')
 parser.add_argument('-I', help='Specify the stap++ tapset library search directory.', dest='inc', action='append')
+parser.add_argument('--version', help='version', action='version', version='%(prog)s 0.0.1')
 parser.add_argument('filename', nargs='?')
 
 args = parser.parse_args()
@@ -325,7 +327,7 @@ args = parser.parse_args()
 shcmd = args.shcmd
 D_opts = args.D_opts if args.D_opts else []
 d_opts = args.d_opts if args.d_opts else []
-_args = args.args if args.args else {}
+_args = args.args if args.args else []
 print_args = args.print_args
 dump_src = args.dump_src
 sample_pid = args.sample_pid
@@ -337,7 +339,15 @@ verbose = args.verbose
 skip_badvars = args.skip_badvars
 inc = args.inc if args.inc else []
 infile = args.filename
-args = _args
+args = {}
+assign = re.compile(r'^[\'"]?(\S+?)\s*=\s*(\S+?)[\'"]?$')
+for arg in _args:
+    matched = assign.match(arg)
+    if matched:
+        key, value = matched.groups()
+        args[key] = value
+    else:
+        die(f"arg '{arg}' not valid format, should use '--arg key=value' ")
 
 inc.append('.')
 bin_path = find_bin()
@@ -462,8 +472,8 @@ if pid:
 if master_pid:
     exec_file = "/proc/{}/exe".format(master_pid)
     if not os.path.exists(exec_file):
-        die("nginx process {} is not running or" \
-            "you do not have enought permissions.\n".format(master_pid))
+        die("Nginx process {} is not running or" \
+            "you do not have enough permissions.\n".format(master_pid))
 
     if not exec_path:
         exec_path = os.readlink(exec_file)
@@ -511,12 +521,12 @@ if print_args:
     sys.exit(0)
 
 for key in args.keys():
-    if not used_std_vars[f"arg_{key}"]:
+    if not used_std_vars.get(f"arg_{key}"):
         val = args[key]
         if not val:
             val = ''
 
-        warn(f"WARNING: arg_{key} is defined by \" --arg {key}={val}\, "
+        warn(f"WARNING: arg_{key} is defined by \" --arg {key}={val} \", "
              "but never used.\n")
 
 tmpdir = tempfile.mkdtemp(prefix='stapxx')
